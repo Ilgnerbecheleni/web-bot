@@ -1,0 +1,278 @@
+{% load static %}
+<!doctype html>
+<html lang="pt-br">
+
+<head>
+  <meta charset="utf-8">
+  <title>POL/USDT — Grid + Stop</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    .grid {
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: 1fr 1fr;
+    }
+
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    canvas {
+      width: 100%;
+      height: 420px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: .2rem .6rem;
+      border-radius: 8px;
+      background: #eee;
+    }
+
+    details summary {
+      cursor: pointer;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="container">
+    {% if messages %}
+    <ul>{% for m in messages %}<li>{{ m }}</li>{% endfor %}</ul>
+    {% endif %}
+
+    <h2>POL/USDT — Grid + Stop</h2>
+
+    <article>
+      <div class="grid">
+
+        <section>
+          <h4>Status</h4>
+          <p id="atr-line">
+            ATR: <strong>—</strong> • Step efetivo: <strong>—</strong> • Stop ATR: <strong>—</strong>
+          </p>
+          <p>
+            Execução:
+            {% if is_running %}<strong class="badge">Rodando</strong>
+            {% else %}<strong class="badge">Parado</strong>{% endif %}
+          </p>
+          <p id="state-line">
+            Ref: <strong>{{ state.ref_price|default:"—" }}</strong> •
+            Máx: <strong>{{ state.trailing_high|default:"—" }}</strong> •
+            Célula: <strong>{{ state.last_level_idx|default:"—" }}</strong>
+          </p>
+          <form method="post" action="{% url 'start_bot' %}" style="display:inline">{% csrf_token %}
+            <button {% if is_running %}disabled{% endif %}>Start</button>
+          </form>
+          <form method="post" action="{% url 'stop_bot' %}" style="display:inline">{% csrf_token %}
+            <button class="secondary" {% if not is_running %}disabled{% endif %}>Stop</button>
+          </form>
+        </section>
+
+        <section>
+          <h4>Configuração & Posição</h4>
+          <form method="post">
+            {% csrf_token %}
+            <input type="hidden" name="save_config" value="1" />
+            <div class="grid" style="grid-template-columns:1fr 1fr;">
+              <label>Qtd POL {{ form.qty }}</label>
+              <label>PM (USDT) {{ form.avg }}</label>
+              <label>Grid step (%) {{ form.grid_step }}</label>
+              <label>Níveis ↑ {{ form.levels_up }}</label>
+              <label>Níveis ↓ {{ form.levels_down }}</label>
+              <label>Stop abaixo do PM (%) {{ form.stop_from_avg }}</label>
+              <label>Intervalo (s) {{ form.interval }}</label>
+              <label>Telegram ligado? {{ form.telegram_enabled }}</label>
+            </div>
+            <button type="submit">Salvar</button>
+          </form>
+        </section>
+      </div>
+    </article>
+
+    <article>
+      <h4>Gráfico (1m klines — via backend)</h4>
+      <canvas id="chart"></canvas>
+      <small>Consulta <code>/api/klines/</code> no Django (com cache curto) para evitar bloqueios/CORS.</small>
+    </article>
+
+    <article>
+      <h4>Recomendações (ao vivo)</h4>
+      <div id="last-reco" style="white-space:pre-line; padding:.6rem; border:1px solid #eee; border-radius:8px;">
+        — aguardando sinais —
+      </div>
+      <details style="margin-top:.5rem;">
+        <summary>Histórico (últimos 20)</summary>
+        <ul id="sig-history"></ul>
+      </details>
+    </article>
+  </main>
+
+  <script>
+    // ====== Helpers ======
+    function ema(values, period) {
+      const k = 2 / (period + 1);
+      const out = new Array(values.length).fill(null);
+      let emaPrev = null;
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        if (v == null) { out[i] = null; continue; }
+        if (emaPrev == null) {
+          // primeira EMA: use SMA inicial
+          const start = Math.max(0, i - period + 1);
+          const slice = values.slice(start, i + 1).filter(x => x != null);
+          if (slice.length === period) {
+            const sma = slice.reduce((a, b) => a + b, 0) / period;
+            emaPrev = sma;
+            out[i] = sma;
+          } else {
+            out[i] = null;
+          }
+        } else {
+          emaPrev = v * k + emaPrev * (1 - k);
+          out[i] = emaPrev;
+        }
+      }
+      return out;
+    }
+
+    // ====== Chart ======
+    const ctx = document.getElementById('chart').getContext('2d');
+    let chart;
+
+    async function fetchKlines(limit = 200, interval = "1m") {
+      const r = await fetch(`/api/klines/?symbol=POLUSDT&interval=${interval}&limit=${limit}`, { cache: "no-store" });
+      if (!r.ok) throw new Error("Falha ao buscar klines");
+      return await r.json(); // [{t, close}]
+    }
+
+    function renderChart(rows) {
+      const labels = rows.map(k => new Date(k.t).toLocaleTimeString());
+      const closes = rows.map(k => k.close);
+
+      // Médias móveis (EMAs 7 e 40)
+      const ema7 = ema(closes, 7);
+      const ema40 = ema(closes, 40);
+
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'Fechamento (1m)',
+              data: closes,
+              borderWidth: 1.2,        // traço mais fino
+              pointRadius: 0,          // sem bolinhas
+              tension: 0.1             // leve suavização
+            },
+            {
+              label: 'EMA 7',
+              data: ema7,
+              borderWidth: 1,          // mais fino ainda
+              pointRadius: 0,
+              borderColor: 'rgba(255, 205, 86, 1)', // amarelo
+              tension: 0.1
+            },
+            {
+              label: 'EMA 40',
+              data: ema40,
+              borderWidth: 1,
+              pointRadius: 0,
+              borderColor: 'rgba(153, 102, 255, 1)', // roxo
+              tension: 0.1
+            }
+          ]
+        },
+        options: {
+          animation: false,
+          interaction: { intersect: false, mode: 'index' },
+          elements: { line: { borderJoinStyle: 'round', borderCapStyle: 'round' } },
+          plugins: {
+            legend: { display: true, labels: { boxWidth: 18, usePointStyle: false } },
+            tooltip: { intersect: false, mode: 'index' }
+          },
+          scales: {
+            x: {
+              ticks: { maxTicksLimit: 12 },
+              grid: { lineWidth: 0.3 }   // grid discreta
+            },
+            y: {
+              grid: { lineWidth: 0.3 },
+              ticks: { maxTicksLimit: 8 }
+            }
+          }
+        }
+      });
+    }
+
+    async function refreshChart() {
+      try { renderChart(await fetchKlines(300, "1m")); } catch (e) { console.error(e); }
+    }
+
+    // ====== Estado + Recomendações (mantém como já estava) ======
+
+    async function refreshSignals() {
+      try {
+        const r = await fetch("/api/signals/", { cache: "no-store" });
+        if (!r.ok) return;
+        const arr = await r.json();
+        const ul = document.querySelector("#sig-history");
+        if (!ul) return;
+        ul.innerHTML = "";
+        arr.forEach(s => {
+          const li = document.createElement("li");
+          const pnl = (s.pnl_pct != null) ? ` | PnL ${s.pnl_pct.toFixed(2)}%` : "";
+          const prc = (s.price != null) ? ` | ${s.price}` : "";
+          li.textContent = `[${s.t}] ${s.kind}${prc}${pnl} — ${s.message.replace(/\n/g, ' ')}`;
+          ul.appendChild(li);
+        });
+      } catch (e) { }
+    }
+
+    async function refreshState(){
+  try{
+    const r = await fetch("/api/state/", {cache:"no-store"});
+    if(!r.ok) return;
+    const s = await r.json();
+
+    const p = document.querySelector("#state-line");
+    if(p){
+      p.innerHTML = `Ref: <strong>${s.ref_price ?? "—"}</strong> • Máx: <strong>${s.trailing_high ?? "—"}</strong> • Célula: <strong>${s.last_level_idx ?? "—"}</strong>`;
+    }
+
+    const a = document.querySelector("#atr-line");
+    if(a){
+      const step = (s.eff_grid_step!=null) ? s.eff_grid_step.toFixed(2) + "%" : "—";
+      a.innerHTML = `ATR: <strong>${s.atr ?? "—"}</strong> • Step efetivo: <strong>${step}</strong> • Stop ATR: <strong>${s.atr_trailing_stop ?? "—"}</strong>`;
+    }
+
+    const box = document.querySelector("#last-reco");
+    if(box){
+      if(s.last_message){
+        const header = s.last_kind ? `(${s.last_kind}) ` : "";
+        const extra  = (s.last_price!=null || s.last_pnl_pct!=null)
+          ? `\nPreço: ${s.last_price ?? "—"}  |  PnL: ${ (s.last_pnl_pct!=null)? s.last_pnl_pct.toFixed(2)+"%" : "—"}`
+          : "";
+        box.textContent = header + s.last_message + extra;
+      } else {
+        box.textContent = "— sem recomendações ainda —";
+      }
+    }
+  }catch(e){}
+}
+
+    // timers
+    refreshChart(); setInterval(refreshChart, 10000);  // 10s
+    refreshState(); setInterval(refreshState, 3000);   // 3s
+    refreshSignals(); setInterval(refreshSignals, 6000);
+  </script>
+
+</body>
+
+</html>

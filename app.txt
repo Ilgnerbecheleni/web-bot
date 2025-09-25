@@ -1,1 +1,363 @@
+# grid_pol_bot.py
+import os
+import time
+import json
+import math
+import argparse
+import threading
+from datetime import datetime, timezone
+import requests
+from dotenv import load_dotenv
 
+DEFAULT_SYMBOL = "POLUSDT"
+DEFAULT_INTERVAL_SEC = 15
+DEFAULT_GRID_STEP_PCT = 0.6
+DEFAULT_LEVELS_UP = 8
+DEFAULT_LEVELS_DOWN = 8
+DEFAULT_STOP_FROM_AVG_PCT = 8.0
+DEFAULT_ALERT_COOLDOWN_SEC = 120
+STATE_FILE = "grid_pol_state.json"
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+def load_state(path=STATE_FILE):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_state(state, path=STATE_FILE):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def pct(a, b):
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
+
+BINANCE = "https://api.binance.com"
+def get_price(symbol=DEFAULT_SYMBOL):
+    r = requests.get(f"{BINANCE}/api/v3/ticker/price", params={"symbol": symbol}, timeout=10)
+    r.raise_for_status()
+    return float(r.json()["price"])
+
+load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def tg_send(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[{now_iso()}] (SEM TELEGRAM) {text}")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"[{now_iso()}] Falha Telegram: {e}")
+
+def build_grid(ref_price, step_pct, levels_up, levels_down):
+    levels = [ref_price * (1 + (i * step_pct / 100.0)) for i in range(-levels_down, levels_up + 1)]
+    levels.sort()
+    def level_index_for(price):
+        idx = max(0, min(len(levels) - 2, next((i for i in range(len(levels) - 1) if levels[i] <= price < levels[i+1]), len(levels) - 2)))
+        return idx
+    return levels, level_index_for
+
+def human_money(v):
+    if v >= 1:
+        return f"{v:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{v:,.6f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def maybe_alert(kind, msg, state, cooldown_sec):
+    last_ts = state.get("last_"+kind, 0)
+    now_ts = time.time()
+    if now_ts - last_ts >= cooldown_sec:
+        tg_send(msg)
+        state["last_"+kind] = now_ts
+        return True
+    return False
+
+class Shared:
+    def __init__(self, qty, avg, grid_step, levels_up, levels_down, stop_from_avg, interval, symbol):
+        self.lock = threading.RLock()
+        self.qty = qty
+        self.avg = avg
+        self.grid_step = grid_step
+        self.levels_up = levels_up
+        self.levels_down = levels_down
+        self.stop_from_avg = stop_from_avg
+        self.interval = interval
+        self.symbol = symbol
+        self.paused = False
+        self.exit_flag = False
+        self.ref_price = None
+        self.levels = []
+        self.idx_for = None
+        self.trailing_high = None
+        self.last_level_idx = None
+        self.stop_line = None
+        self.state = load_state()
+
+    def with_lock(self, fn):
+        with self.lock:
+            return fn()
+
+def cli_thread(shared: "Shared"):
+    help_txt = (
+        "\nComandos disponíveis:\n"
+        "  status                 -> mostra parâmetros e preço ref\n"
+        "  set qty <num>          -> define quantidade\n"
+        "  set avg <num>          -> define preço médio\n"
+        "  set step <pct>         -> define passo da grade (%)\n"
+        "  set stop <pct>         -> define stop abaixo do PM (%)\n"
+        "  reset ref              -> recalcula preço de referência (usa preço atual)\n"
+        "  pause / resume         -> pausa/retoma loop de checagem\n"
+        "  exit                   -> sair\n"
+    )
+    print(help_txt, flush=True)
+    while True:
+        try:
+            cmd = input("> ").strip()
+        except EOFError:
+            cmd = "exit"
+        if not cmd:
+            continue
+        parts = cmd.split()
+        head = parts[0].lower()
+
+        if head == "exit":
+            shared.with_lock(lambda: setattr(shared, "exit_flag", True))
+            print("Encerrando…")
+            break
+
+        if head == "status":
+            def _status():
+                print(f"\n== STATUS @ {now_iso()} ==")
+                print(f"qty={shared.qty}  avg={shared.avg}  step={shared.grid_step}%  stop={shared.stop_from_avg}%")
+                print(f"levels_up={shared.levels_up}  levels_down={shared.levels_down}  interval={shared.interval}s")
+                print(f"paused={shared.paused}")
+                if shared.ref_price:
+                    print(f"ref={human_money(shared.ref_price)}  stop_line={human_money(shared.stop_line)}")
+                print()
+            shared.with_lock(_status)
+            continue
+
+        if head == "pause":
+            shared.with_lock(lambda: setattr(shared, "paused", True))
+            print("Loop pausado.")
+            continue
+
+        if head == "resume":
+            shared.with_lock(lambda: setattr(shared, "paused", False))
+            print("Loop retomado.")
+            continue
+
+        if head == "reset" and len(parts) >= 2 and parts[1].lower() == "ref":
+            def _reset():
+                try:
+                    price = get_price(shared.symbol)
+                    shared.ref_price = price
+                    shared.state["ref_price"] = price
+                    shared.trailing_high = price
+                    shared.state["trailing_high"] = price
+                    shared.levels, shared.idx_for = build_grid(price, shared.grid_step, shared.levels_up, shared.levels_down)
+                    shared.last_level_idx = shared.idx_for(price)
+                    shared.state["last_level_idx"] = shared.last_level_idx
+                    save_state(shared.state)
+                    print(f"Preço de referência redefinido para {human_money(price)}.")
+                except Exception as e:
+                    print(f"Erro ao resetar ref: {e}")
+            shared.with_lock(_reset)
+            continue
+
+        if head == "set" and len(parts) >= 3:
+            key = parts[1].lower()
+            val = parts[2]
+            def _set():
+                try:
+                    if key == "qty":
+                        shared.qty = float(val)
+                    elif key == "avg":
+                        shared.avg = float(val)
+                        shared.stop_line = shared.avg * (1 - shared.stop_from_avg/100.0)
+                    elif key == "step":
+                        shared.grid_step = float(val)
+                        if shared.ref_price:
+                            shared.levels, shared.idx_for = build_grid(shared.ref_price, shared.grid_step, shared.levels_up, shared.levels_down)
+                    elif key == "stop":
+                        shared.stop_from_avg = float(val)
+                        shared.stop_line = shared.avg * (1 - shared.stop_from_avg/100.0)
+                    else:
+                        print("Parâmetro desconhecido.")
+                        return
+                    print("OK.")
+                except Exception as e:
+                    print(f"Valor inválido: {e}")
+            shared.with_lock(_set)
+            continue
+
+        print("Comando não reconhecido. Digite 'status' ou 'exit'.")
+
+def run_bot(args):
+    # coleta parâmetros (modo interativo opcional)
+    if args.interactive:
+        def ask_float(prompt, default):
+            s = input(f"{prompt} [{default}]: ").strip()
+            return float(s) if s else float(default)
+        def ask_int(prompt, default):
+            s = input(f"{prompt} [{default}]: ").strip()
+            return int(s) if s else int(default)
+
+        qty = ask_float("Quantidade de POL que você possui", args.qty or 0.0)
+        avg = ask_float("Seu preço médio (USDT)", args.avg or 0.0)
+        grid_step = ask_float("Passo da grade (%)", args.grid_step)
+        levels_up = ask_int("Níveis acima", args.levels_up)
+        levels_down = ask_int("Níveis abaixo", args.levels_down)
+        stop_from_avg = ask_float("Stop abaixo do PM (%)", args.stop_from_avg)
+        interval = ask_int("Intervalo de checagem (s)", args.interval)
+    else:
+        if args.qty is None or args.avg is None:
+            raise SystemExit("Erro: informe --qty e --avg ou use --interactive para digitar pelo teclado.")
+        qty, avg = args.qty, args.avg
+        grid_step = args.grid_step
+        levels_up = args.levels_up
+        levels_down = args.levels_down
+        stop_from_avg = args.stop_from_avg
+        interval = args.interval
+
+    shared = Shared(
+        qty=qty, avg=avg, grid_step=grid_step, levels_up=levels_up, levels_down=levels_down,
+        stop_from_avg=stop_from_avg, interval=interval, symbol=DEFAULT_SYMBOL
+    )
+
+    # inicialização de preços e grade
+    try:
+        price = get_price(shared.symbol)
+        shared.ref_price = shared.state.get("ref_price") or price
+        shared.state["ref_price"] = shared.ref_price
+        shared.levels, shared.idx_for = build_grid(shared.ref_price, shared.grid_step, shared.levels_up, shared.levels_down)
+        shared.trailing_high = shared.state.get("trailing_high", shared.ref_price)
+        shared.stop_line = shared.avg * (1 - shared.stop_from_avg/100.0)
+        shared.last_level_idx = shared.state.get("last_level_idx", shared.idx_for(price))
+        shared.state["last_level_idx"] = shared.last_level_idx
+        save_state(shared.state)
+    except Exception as e:
+        print(f"[{now_iso()}] Erro preço inicial: {e}")
+        return
+
+    # Mensagem inicial
+    maybe_alert(
+        "startup",
+        f"🚀 GRID+STOP iniciado ({shared.symbol}). PM {human_money(shared.avg)} | Qtd {shared.qty}\n"
+        f"Ref {human_money(shared.ref_price)} | Grade ±{shared.levels_down}/{shared.levels_up} @ {shared.grid_step:.2f}%\n"
+        f"Stop (PM - {shared.stop_from_avg:.1f}%): {human_money(shared.stop_line)}",
+        shared.state,
+        cooldown_sec=3
+    )
+    save_state(shared.state)
+
+    # Thread para ler comandos do teclado
+    t = threading.Thread(target=cli_thread, args=(shared,), daemon=True)
+    t.start()
+
+    # Loop principal
+    while True:
+        with shared.lock:
+            if shared.exit_flag:
+                break
+            if shared.paused:
+                time.sleep(0.5)
+                continue
+
+            try:
+                price = get_price(shared.symbol)
+                # atualiza máxima
+                if shared.trailing_high is None or price > shared.trailing_high:
+                    shared.trailing_high = price
+                    shared.state["trailing_high"] = price
+
+                pnl_pct = pct(price, shared.avg)
+                pnl_val = (price - shared.avg) * shared.qty
+
+                # stop baseado no PM
+                if price <= shared.stop_line:
+                    maybe_alert(
+                        "stop",
+                        f"🛑 STOP! Preço {human_money(price)} <= {human_money(shared.stop_line)} "
+                        f"(PM {human_money(shared.avg)} | {pnl_pct:.2f}% | ~{human_money(pnl_val)} USDT).",
+                        shared.state,
+                        cooldown_sec=DEFAULT_ALERT_COOLDOWN_SEC if shared.state.get("cooldown_override") is None else shared.state["cooldown_override"]
+                    )
+
+                # alertas de drawdown vs topo local
+                drop_from_high = pct(price, shared.trailing_high)
+                for dd in (-3, -5, -8, -10):
+                    key = f"dd{abs(dd)}"
+                    flagged = shared.state.get("dd_flags", {}).get(key, False)
+                    if drop_from_high <= dd and not flagged:
+                        if maybe_alert(
+                            key,
+                            f"⚠️ Queda de {abs(dd)}% desde a máxima recente.\n"
+                            f"Preço: {human_money(price)} | Máx: {human_money(shared.trailing_high)}\n"
+                            f"PM: {human_money(shared.avg)} | PnL: {pnl_pct:.2f}% (~{human_money(pnl_val)} USDT).\n"
+                            f"💡 Digite 'status' ou 'set avg <num>' para ajustar o PM, se necessário.",
+                            shared.state,
+                            cooldown_sec=DEFAULT_ALERT_COOLDOWN_SEC
+                        ):
+                            shared.state.setdefault("dd_flags", {})[key] = True
+                            save_state(shared.state)
+
+                # cruzamento de célula da grade
+                idx = shared.idx_for(price)
+                if idx != shared.last_level_idx:
+                    direction = "⬆️" if idx > shared.last_level_idx else "⬇️"
+                    lower = shared.levels[idx]
+                    upper = shared.levels[idx+1]
+                    mid = (lower + upper)/2
+                    dist_mid_pct = pct(price, mid)
+
+                    msg = (
+                        f"📊 {direction} {shared.symbol} cruzou nível da grade\n"
+                        f"Faixa: {human_money(lower)} – {human_money(upper)} (Δ {shared.grid_step:.2f}%)\n"
+                        f"Preço: {human_money(price)} | PM: {human_money(shared.avg)} | PnL: {pnl_pct:.2f}% (~{human_money(pnl_val)} USDT)\n"
+                        f"💬 Console: use 'set qty/avg', 'reset ref', 'pause', 'resume', 'status'.\n"
+                    )
+                    if idx > shared.last_level_idx:
+                        msg += "Sugestão: possível venda parcial em resistência.\n"
+                    else:
+                        msg += "Sugestão: possível compra parcial em suporte.\n"
+
+                    if maybe_alert("grid", msg, shared.state, cooldown_sec=DEFAULT_ALERT_COOLDOWN_SEC):
+                        shared.last_level_idx = idx
+                        shared.state["last_level_idx"] = idx
+                        save_state(shared.state)
+
+                print(f"[{now_iso()}] Preço {human_money(price)} | PnL {pnl_pct:+.2f}% | célula {shared.last_level_idx}")
+
+            except requests.HTTPError as e:
+                print(f"[{now_iso()}] HTTPError: {e}")
+            except Exception as e:
+                print(f"[{now_iso()}] Erro: {e}")
+
+        time.sleep(shared.interval)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bot GRID+STOP para POL/USDT (alertas Telegram + modo interativo)")
+    parser.add_argument("--qty", type=float, help="Quantidade de POL (ex.: 92)")
+    parser.add_argument("--avg", type=float, help="Preço médio em USDT (ex.: 0.269)")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SEC, help="Segundos entre checagens (default: 15)")
+    parser.add_argument("--grid-step", type=float, default=DEFAULT_GRID_STEP_PCT, help="Passo da grade em %% (default: 0.6)")
+    parser.add_argument("--levels-up", type=int, default=DEFAULT_LEVELS_UP, help="Níveis acima (default: 8)")
+    parser.add_argument("--levels-down", type=int, default=DEFAULT_LEVELS_DOWN, help="Níveis abaixo (default: 8)")
+    parser.add_argument("--stop-from-avg", type=float, default=DEFAULT_STOP_FROM_AVG_PCT, help="Stop X%% abaixo do PM (default: 8)")
+    parser.add_argument("--interactive", action="store_true", help="Perguntar parâmetros via input() e habilitar comandos no console")
+    args = parser.parse_args()
+    run_bot(args)

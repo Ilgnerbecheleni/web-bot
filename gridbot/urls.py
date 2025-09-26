@@ -4,8 +4,7 @@ from . import views
 urlpatterns = [
     path("", views.dashboard, name="dashboard"),
     path("ping/", views.ping, name="ping"),
-    path("start/", views.start_bot, name="start_bot"),
-    path("stop/", views.stop_bot, name="stop_bot"),
+    path("test-telegram/", views.test_telegram, name="test_telegram"),
     # APIs
     path("api/state/", views.state_json, name="state_json"),
     path("api/signals/", views.signals_json, name="signals_json"),

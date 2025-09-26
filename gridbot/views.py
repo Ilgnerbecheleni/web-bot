@@ -1,4 +1,4 @@
-import os, random, time, requests
+import random, time, requests
 from django.http import HttpResponse, JsonResponse, HttpResponseBadRequest
 from django.shortcuts import render, redirect
 from django.views.decorators.http import require_GET, require_POST
@@ -8,9 +8,9 @@ from django.conf import settings
 
 from .models import BotConfig, BotState, BotSignal
 from .forms import BotConfigForm
-from .runner_registry import BotRegistry
 
-def ping(request): return HttpResponse("pong gridbot")
+def ping(request): 
+    return HttpResponse("pong gridbot")
 
 def dashboard(request):
     cfg = BotConfig.objects.order_by("-id").first() or BotConfig.objects.create()
@@ -28,22 +28,12 @@ def dashboard(request):
     return render(request, "gridbot/dashboard.html", {
         "form": form,
         "state": state,
-        "is_running": BotRegistry.running(),
+        # sem threads no web: status é o que o processo runbot gravar
+        "is_running": bool(state.running),
+        "service_mode": True,  # para o template mostrar aviso "rodando via Supervisor"
     })
 
-@require_POST
-def start_bot(request):
-    ok = BotRegistry.start()
-    messages.success(request, "Bot iniciado." if ok else "Bot já estava rodando.")
-    return redirect("dashboard")
-
-@require_POST
-def stop_bot(request):
-    ok = BotRegistry.stop()
-    messages.warning(request, "Bot parado." if ok else "Bot não estava rodando.")
-    return redirect("dashboard")
-
-# --- Teste Telegram ---
+# --- Telegram teste ---
 def _send_telegram(text: str):
     token = settings.TELEGRAM_BOT_TOKEN
     chat_id = settings.TELEGRAM_CHAT_ID
@@ -75,7 +65,6 @@ def state_json(request):
         "last_message": st.last_message,
         "last_price": st.last_price,
         "last_pnl_pct": st.last_pnl_pct,
-        # ATR / step / stop ATR:
         "atr": st.atr,
         "eff_grid_step": st.eff_grid_step,
         "atr_trailing_stop": st.atr_trailing_stop,
@@ -131,7 +120,6 @@ def klines_proxy(request):
     t0 = int(time.time() - limit*60) * 1000
     price = base
     for i in range(limit):
-        import random
         price += random.uniform(-0.002, 0.002)
         rows.append({"t": t0 + i*60_000, "close": round(max(price, 0.01), 6)})
     return JsonResponse(rows, safe=False)
